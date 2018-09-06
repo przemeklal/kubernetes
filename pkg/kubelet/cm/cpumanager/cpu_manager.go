@@ -199,10 +199,6 @@ func (m *manager) GetNUMAHints(pod v1.Pod, container v1.Container) numamanager.N
 	cpuAccum := newCPUAccumulator(topo, assignableCPUs, numCPUs)
         glog.Infof("[cpumanager] New CPU Accumulator: %v", cpuAccum)
 
-	// Check for empty sockets
-	freeSockets := cpuAccum.freeSockets()
-	glog.Infof("[cpumanager] Free Sockets: %v", freeSockets)
-	
 	// Check for empty cores
 	freeCores := cpuAccum.freeCores()
 	glog.Infof("[cpumanager] Free Cores: %v", freeCores)
@@ -210,47 +206,48 @@ func (m *manager) GetNUMAHints(pod v1.Pod, container v1.Container) numamanager.N
 	// Check for empty CPUs
 	freeCPUs := cpuAccum.freeCPUs()
         glog.Infof("[cpumanager] Free CPUs: %v", freeCPUs)
-	// Check sockets individually (bool)
-	socket0Free := cpuAccum.isSocketFree(0)
-        glog.Infof("[cpumanager] Socket 0 free: %v", socket0Free)
-	socket1Free := cpuAccum.isSocketFree(1)
-	glog.Infof("[cpumanager] Socket 1 free: %v", socket1Free)
-
-
-	//Create mask based on socket true/false values
-	var nm []int64	
-	if socket0Free == false && socket1Free == true {
-		nm = append(nm, 01)
-		glog.Infof("[cpumanager] NUMA Affinities for pod, container %v %v are %v", string(pod.UID), container.Name, nm)
+	
+	// Get total number of sockets on machine
+	socketCnt := topo.NumSockets
+	glog.Infof("[cpumanager] Number of sockets on machine (available and unavailable): %v", socketCnt)
+	
+	// Get number of FREE sockets
+	freeSockets := cpuAccum.freeSockets()
+	glog.Infof("[cpumanager] Free Sockets: %v", freeSockets)
+	freeSocketCnt := len(freeSockets)	
+	
+	//If no free sockets available return No NUMA Affinity
+	var nm0 []int64	
+	if freeSocketCnt == 0 {		
+		glog.Infof("[cpumanager] Number of free sockets available: %v. No NUMA Affinity",freeSocketCnt)
 		return numamanager.NumaMask{
-           		Mask:     nm,
-          		Affinity: true,
-        	}
-
-	} else if socket0Free == true && socket1Free == false {
-		nm = append(nm, 10)
-		glog.Infof("[cpumanager] NUMA Affinities for pod, container %v %v are %v", string(pod.UID), container.Name, nm)
-		return numamanager.NumaMask{
-           		Mask:     nm,
-           		Affinity: true,
-        	}
-
-	} else if socket0Free == true && socket1Free == true {
-		nm = append(nm, 11)
-	        glog.Infof("[cpumanager] NUMA Affinities for pod, container %v %v are %v", string(pod.UID), container.Name, nm)
-		return numamanager.NumaMask{
-           		Mask:     nm,
-           		Affinity: true,
-        	}
-
-	} else {
-		nm = append(nm, 00)
-	        glog.Infof("[cpumanager] NUMA Affinities for pod, container %v %v are %v", string(pod.UID), container.Name, nm)
-		return numamanager.NumaMask{
-           		Mask:     nm,
-           		Affinity: false,
-        	}
+                        Mask:     nm0,
+                        Affinity: false,
+                }
 	}
+
+	// Arrays for mask and looping through sockets
+	nm := make([]int64, socketCnt)
+	socket := make([]bool, socketCnt)
+	
+	// Loop through each socket checking availability and populate mask accordingly
+	for i := 0; i < socketCnt; i++ {
+		socket[i] = cpuAccum.isSocketFree(i)
+		glog.Infof("[cpumanager] Socket %v Free : %v",i, socket[i])
+		if socket[i] == true {
+			glog.Infof("[cpumanager] Set Mask: nm = %v : %v",i, 1)
+			nm[i] = 1
+		} else if socket[i] == false {
+			glog.Infof("[cpumanager] Set Mask: nm = %v : %v",i, 0)
+			nm[i] = 0
+		}	
+	}
+	glog.Infof("[cpumanager] NUMA Affinities for pod, container %v %v are %v", string(pod.UID), container.Name, nm)
+
+	return numamanager.NumaMask{
+        	Mask:     nm,
+    	      	Affinity: true,
+       	}
 }
 
 func (m *manager) Start(activePods ActivePodsFunc, podStatusProvider status.PodStatusProvider, containerRuntime runtimeService) {
