@@ -70,7 +70,7 @@ type Manager interface {
 	GetAffinity() numamanager.Store
 
 	// CPU Manager is a NUMA Hint Provider	
-    numamanager.HintProvider
+    	numamanager.HintProvider
 
 }
 
@@ -166,13 +166,20 @@ func (m *manager) GetAffinity() numamanager.Store {
        return m.affinity
 }
 
-func (m *manager) GetNUMAHints(pod v1.Pod, container v1.Container) numamanager.NumaMask {
+func (m *manager) GetNUMAHints(resource string, amount int) numamanager.NumaMask {
 	//For testing purposes - manager should consult available resources and make numa mask based on container request
-	var nm []int64
+    	var nm []int64
+    	if resource != "cpu" {
+        	glog.Infof("Resource %v not managed by CPU Manager", resource)
+        	return numamanager.NumaMask{
+            		Mask:           nm,
+            	Affinity:       false,
+       	 	}	 
+    	}	
 	nm = append(nm, 11)
 	nm = append(nm, 01)
 	nm = append(nm, 10)
-	glog.Infof("[cpumanager] NUMA Affinities for pod, container %v %v are %v", string(pod.UID), container.Name, nm)
+    	glog.Infof("Container Resource Name in NUMA Manager: %v, Amount: %v", resource, amount)
 	return numamanager.NumaMask{
 	   Mask:     nm,
 	   Affinity: true,
