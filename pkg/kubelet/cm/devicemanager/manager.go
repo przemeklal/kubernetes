@@ -22,6 +22,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+    "strconv"
 	"sync"
 	"time"
 
@@ -88,6 +89,9 @@ type ManagerImpl struct {
 	podDevices        podDevices
 	pluginOpts        map[string]*pluginapi.DevicePluginOptions
 	checkpointManager checkpointmanager.CheckpointManager
+    
+    //Store of NUMA Affinties that the Device Manager can query
+    numaAffinityStore numamanager.Store
 }
 
 type sourcesReadyStub struct{}
@@ -96,11 +100,11 @@ func (s *sourcesReadyStub) AddSource(source string) {}
 func (s *sourcesReadyStub) AllReady() bool          { return true }
 
 // NewManagerImpl creates a new manager.
-func NewManagerImpl() (*ManagerImpl, error) {
-	return newManagerImpl(pluginapi.KubeletSocket)
+func NewManagerImpl(numaAffinityStore numamanager.Store) (*ManagerImpl, error) {
+	return newManagerImpl(pluginapi.KubeletSocket, numaAffinityStore)
 }
 
-func newManagerImpl(socketPath string) (*ManagerImpl, error) {
+func newManagerImpl(socketPath string, numaAffinityStore numamanager.Store) (*ManagerImpl, error) {
 	glog.V(2).Infof("Creating Device Plugin manager at %s", socketPath)
 
 	if socketPath == "" || !filepath.IsAbs(socketPath) {
@@ -109,14 +113,15 @@ func newManagerImpl(socketPath string) (*ManagerImpl, error) {
 
 	dir, file := filepath.Split(socketPath)
 	manager := &ManagerImpl{
-		endpoints:        make(map[string]endpoint),
-		socketname:       file,
-		socketdir:        dir,
-		healthyDevices:   make(map[string]sets.String),
-		unhealthyDevices: make(map[string]sets.String),
-		allocatedDevices: make(map[string]sets.String),
-		pluginOpts:       make(map[string]*pluginapi.DevicePluginOptions),
-		podDevices:       make(podDevices),
+		endpoints:          make(map[string]endpoint),
+		socketname:         file,
+		socketdir:          dir,
+		healthyDevices:     make(map[string]sets.String),
+		unhealthyDevices:   make(map[string]sets.String),
+		allocatedDevices:   make(map[string]sets.String),
+		pluginOpts:         make(map[string]*pluginapi.DevicePluginOptions),
+		podDevices:         make(podDevices),
+        numaAffinityStore:  numaAffinityStore,
 	}
 	manager.callback = manager.genericDeviceUpdateCallback
 
@@ -133,11 +138,71 @@ func newManagerImpl(socketPath string) (*ManagerImpl, error) {
 	return manager, nil
 }
 
-func (m *ManagerImpl) GetNUMAHints(pod v1.Pod, container v1.Container) numamanager.NumaMask {
-	//For testing purposes - manager should consult available resources and make numa mask based on container request
-	var nm []int64
-	nm = append(nm, 01)
-	glog.Infof("[devicemanager] NUMA Affinities for pod, container %v %v are %v", string(pod.UID), container.Name, nm)
+func (m *ManagerImpl) GetNUMAHints(resource string, amount int) numamanager.NumaMask {
+	devices := m.Devices()
+    var nm []int64
+    glog.Infof("Devices in GetNUMAHints: %v", devices)
+    
+    glog.Infof("Container Resource Name in Device Manager: %v, Amount: %v", resource, amount)
+    if !m.isDevicePluginResource(resource) {
+        glog.Infof("Resource not managed by Device Manager")
+        return numamanager.NumaMask{
+            Mask:           nm,
+            Affinity:       false,
+        }
+    }    
+    glog.Infof("Resource managed by Device Manager")
+    if _, ok := m.healthyDevices[resource]; !ok {
+        glog.Infof("No healthy devices available for ")
+        return numamanager.NumaMask{
+            Mask:           nm,
+            Affinity:       false,
+        }
+    } 
+
+    // Gets Devices in use.
+	devicesInUse := m.allocatedDevices[resource]
+    glog.Infof("Devices in use:%v", devicesInUse)
+	// Gets a list of available devices.
+	available := m.healthyDevices[resource].Difference(devicesInUse)
+	if int(available.Len()) < amount {
+		glog.Infof("requested number of devices unavailable for %s. Requested: %d, Available: %d", resource, amount, available.Len())
+        return numamanager.NumaMask{
+            Mask:           nm,
+            Affinity:       false,
+        }
+	}
+    glog.Infof("Available devices for resource: %v", available)
+    duplicates := map[int]bool{}
+    for availID := range available {
+        for _, device := range devices[resource] {
+            glog.Infof("AvailID: %v DeviceID: %v", availID, device)
+            if availID == device.ID {
+                socket := device.Socket
+                glog.Infof("Socket: %v", socket)
+                //Efficiency?
+                deviceMask := ""
+                socketMask := [2]int{0,0}
+                socketMask[socket] = 1
+                for _, bit := range socketMask {
+                    deviceMask += strconv.Itoa(bit)
+                }
+                glog.Infof("DeviceMask: %v", deviceMask)
+                deviceMaskInt, err := strconv.Atoi(deviceMask)
+                if err != nil {
+                    glog.Errorf("Err: Cannot convert deviceMask to int. %v")
+                    break
+                }
+                if !duplicates[deviceMaskInt] {
+                    duplicates[deviceMaskInt] = true
+                    nm = append(nm, int64(deviceMaskInt))
+                }
+                break
+            }
+        }
+    }
+    
+	glog.Infof("[devicemanager] NUMA Affinities for %v %v resource(s) are %v", amount, resource, nm)
 	return numamanager.NumaMask{
 		  Mask:           nm,
 		  Affinity:       true,
@@ -254,7 +319,7 @@ func (m *ManagerImpl) Start(activePods ActivePodsFunc, sourcesReady config.Sourc
 // Devices is the map of devices that are known by the Device
 // Plugin manager with the kind of the devices as key
 func (m *ManagerImpl) Devices() map[string][]pluginapi.Device {
-	m.mutex.Lock()
+    m.mutex.Lock()
 	defer m.mutex.Unlock()
 
 	devs := make(map[string][]pluginapi.Device)
@@ -262,7 +327,6 @@ func (m *ManagerImpl) Devices() map[string][]pluginapi.Device {
 		glog.V(3).Infof("Endpoint: %+v: %p", k, e)
 		devs[k] = e.getDevices()
 	}
-
 	return devs
 }
 
@@ -550,7 +614,8 @@ func (m *ManagerImpl) updateAllocatedDevices(activePods []*v1.Pod) {
 // Returns list of device Ids we need to allocate with Allocate rpc call.
 // Returns empty list in case we don't need to issue the Allocate rpc call.
 func (m *ManagerImpl) devicesToAllocate(podUID, contName, resource string, required int, reusableDevices sets.String) (sets.String, error) {
-	m.mutex.Lock()
+	allDevices := m.Devices()
+    m.mutex.Lock()
 	defer m.mutex.Unlock()
 	needed := required
 	// Gets list of devices that have already been allocated.
@@ -591,10 +656,38 @@ func (m *ManagerImpl) devicesToAllocate(podUID, contName, resource string, requi
 	devicesInUse := m.allocatedDevices[resource]
 	// Gets a list of available devices.
 	available := m.healthyDevices[resource].Difference(devicesInUse)
-	if int(available.Len()) < needed {
+    
+    //Get NUMA Mask for pod/container here, check available against devices to get devices that have the same socket and update available to these
+    podNUMAAffinity := m.numaAffinityStore.GetAffinity(podUID, contName)
+    glog.Infof("NUMA Affinities for pod %v container %v are: %v", podUID, contName, podNUMAAffinity)
+    
+    //temporary hack - needs addressing
+    var socket int64
+    if podNUMAAffinity.Mask[0] == 01 {
+        socket = 1
+    } else if podNUMAAffinity.Mask[0] == 10 {
+        socket = 0
+    }
+    availableNUMAAligned := available
+    glog.Infof("allDevice: %v", allDevices)
+    for availID := range available {
+        for _, device := range allDevices[resource] {
+            glog.Infof("AvailID: %v DeviceID: %v", availID, device)
+            if availID == device.ID {
+                if device.Socket != socket {
+                    delete(availableNUMAAligned, availID)
+                }
+                break
+            }    
+        }
+    }
+    
+	if int(availableNUMAAligned.Len()) < needed {
 		return nil, fmt.Errorf("requested number of devices unavailable for %s. Requested: %d, Available: %d", resource, needed, available.Len())
 	}
-	allocated := available.UnsortedList()[:needed]
+    
+    glog.Infof("Available after NUMA Alignment: %v", availableNUMAAligned)
+	allocated := availableNUMAAligned.UnsortedList()[:needed]
 	// Updates m.allocatedDevices with allocated devices to prevent them
 	// from being allocated to other pods/containers, given that we are
 	// not holding lock during the rpc call.
