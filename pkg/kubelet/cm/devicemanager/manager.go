@@ -140,69 +140,88 @@ func newManagerImpl(socketPath string, numaAffinityStore numamanager.Store) (*Ma
 
 func (m *ManagerImpl) GetNUMAHints(resource string, amount int) numamanager.NumaMask {
 	devices := m.Devices()
-    var nm []int64
-    glog.Infof("Devices in GetNUMAHints: %v", devices)
+    	var nm []int64
+    	glog.Infof("Devices in GetNUMAHints: %v", devices)
     
-    glog.Infof("Container Resource Name in Device Manager: %v, Amount: %v", resource, amount)
-    if !m.isDevicePluginResource(resource) {
-        glog.Infof("Resource not managed by Device Manager")
-        return numamanager.NumaMask{
-            Mask:           nm,
-            Affinity:       false,
-        }
-    }    
-    glog.Infof("Resource managed by Device Manager")
-    if _, ok := m.healthyDevices[resource]; !ok {
-        glog.Infof("No healthy devices available for ")
-        return numamanager.NumaMask{
-            Mask:           nm,
-            Affinity:       false,
-        }
-    } 
+    	glog.Infof("Container Resource Name in Device Manager: %v, Amount: %v", resource, amount)
+    	if !m.isDevicePluginResource(resource) {
+        	glog.Infof("Resource not managed by Device Manager")
+        	return numamanager.NumaMask{
+            		Mask:           nm,
+            		Affinity:       false,
+        	}
+    	}    
+    	glog.Infof("Resource managed by Device Manager")
+    	if _, ok := m.healthyDevices[resource]; !ok {
+        	glog.Infof("No healthy devices available for ")
+        	return numamanager.NumaMask{
+            		Mask:           nm,
+            		Affinity:       false,
+        	}
+    	} 
 
-    // Gets Devices in use.
+    	// Gets Devices in use.
 	devicesInUse := m.allocatedDevices[resource]
-    glog.Infof("Devices in use:%v", devicesInUse)
+    	glog.Infof("Devices in use:%v", devicesInUse)
 	// Gets a list of available devices.
 	available := m.healthyDevices[resource].Difference(devicesInUse)
 	if int(available.Len()) < amount {
 		glog.Infof("requested number of devices unavailable for %s. Requested: %d, Available: %d", resource, amount, available.Len())
-        return numamanager.NumaMask{
-            Mask:           nm,
-            Affinity:       false,
-        }
+        	return numamanager.NumaMask{
+            	Mask:           nm,
+            	Affinity:       false,
+        	}
 	}
-    glog.Infof("Available devices for resource: %v", available)
-    duplicates := map[int]bool{}
-    for availID := range available {
-        for _, device := range devices[resource] {
-            glog.Infof("AvailID: %v DeviceID: %v", availID, device)
-            if availID == device.ID {
-                socket := device.Socket
-                glog.Infof("Socket: %v", socket)
-                //Efficiency?
-                deviceMask := ""
-                socketMask := [2]int{0,0}
-                socketMask[socket] = 1
-                for _, bit := range socketMask {
-                    deviceMask += strconv.Itoa(bit)
-                }
-                glog.Infof("DeviceMask: %v", deviceMask)
-                deviceMaskInt, err := strconv.Atoi(deviceMask)
-                if err != nil {
-                    glog.Errorf("Err: Cannot convert deviceMask to int. %v")
-                    break
-                }
-                if !duplicates[deviceMaskInt] {
-                    duplicates[deviceMaskInt] = true
-                    nm = append(nm, int64(deviceMaskInt))
-                }
-                break
-            }
-        }
-    }
-    
-	glog.Infof("[devicemanager] NUMA Affinities for %v %v resource(s) are %v", amount, resource, nm)
+    	glog.Infof("Available devices for resource: %v", available)
+    	//Figure this out programatically 
+    	const numSockets int = 2
+    	duplicates := map[int]bool{}
+    	socketsAvail := map[int]int{}
+    	defaultMask := [numSockets]int{}
+    	for availID := range available {
+        	for _, device := range devices[resource] {
+            		glog.Infof("AvailID: %v DeviceID: %v", availID, device)
+            		if availID == device.ID {
+                		socket := int(device.Socket)
+                		socketsAvail[socket]++
+                		if socketsAvail[socket] >= amount {
+                    			glog.Infof("Socket: %v", socket)
+                    			//Efficiency?
+                    			deviceMask := ""
+                    			socketMask := [numSockets]int{0,0}
+                    			socketMask[socket] = 1
+                    			for _, bit := range socketMask {
+                        			deviceMask += strconv.Itoa(bit)
+                    			}
+                    			glog.Infof("DeviceMask: %v", deviceMask)
+                    			deviceMaskInt, err := strconv.Atoi(deviceMask)
+                    			if err != nil {
+                        			glog.Errorf("Err: Cannot convert deviceMask to int. %v")
+                        			break
+                    			}
+                    			if !duplicates[deviceMaskInt] {
+                        			duplicates[deviceMaskInt] = true
+                        			nm = append(nm, int64(deviceMaskInt))
+                    			}
+                	        }    
+                		//WIP for preferred     
+                		defaultMask[socket] = 1             
+                		break
+            		}
+        	}
+    	}
+    	//WIP for preferred  
+    	deviceMask := ""
+    	for _, bit := range defaultMask {
+        	deviceMask += strconv.Itoa(bit)
+    	}
+    	glog.Infof("DeviceMask: %v", deviceMask)
+    	deviceMaskInt, err := strconv.Atoi(deviceMask)
+    	if err != nil {
+        	glog.Errorf("Err: Cannot convert deviceMask to int. %v")
+    	}
+    	nm = append(nm, int64(deviceMaskInt))
+    	glog.Infof("[devicemanager] NUMA Affinities for %v %v resource(s) are %v", amount, resource, nm)
 	return numamanager.NumaMask{
 		  Mask:           nm,
 		  Affinity:       true,
@@ -615,7 +634,7 @@ func (m *ManagerImpl) updateAllocatedDevices(activePods []*v1.Pod) {
 // Returns empty list in case we don't need to issue the Allocate rpc call.
 func (m *ManagerImpl) devicesToAllocate(podUID, contName, resource string, required int, reusableDevices sets.String) (sets.String, error) {
 	allDevices := m.Devices()
-    m.mutex.Lock()
+    	m.mutex.Lock()
 	defer m.mutex.Unlock()
 	needed := required
 	// Gets list of devices that have already been allocated.
@@ -657,37 +676,41 @@ func (m *ManagerImpl) devicesToAllocate(podUID, contName, resource string, requi
 	// Gets a list of available devices.
 	available := m.healthyDevices[resource].Difference(devicesInUse)
     
-    //Get NUMA Mask for pod/container here, check available against devices to get devices that have the same socket and update available to these
-    podNUMAAffinity := m.numaAffinityStore.GetAffinity(podUID, contName)
-    glog.Infof("NUMA Affinities for pod %v container %v are: %v", podUID, contName, podNUMAAffinity)
+    	//Get NUMA Mask for pod/container here, check available against devices to get devices that have the same socket and update available to these
+    	podNUMAAffinity := m.numaAffinityStore.GetAffinity(podUID, contName)
+    	glog.Infof("NUMA Affinities for pod %v container %v are: %v", podUID, contName, podNUMAAffinity)
     
-    //temporary hack - needs addressing
-    var socket int64
-    if podNUMAAffinity.Mask[0] == 01 {
-        socket = 1
-    } else if podNUMAAffinity.Mask[0] == 10 {
-        socket = 0
-    }
-    availableNUMAAligned := available
-    glog.Infof("allDevice: %v", allDevices)
-    for availID := range available {
-        for _, device := range allDevices[resource] {
-            glog.Infof("AvailID: %v DeviceID: %v", availID, device)
-            if availID == device.ID {
-                if device.Socket != socket {
-                    delete(availableNUMAAligned, availID)
-                }
-                break
-            }    
-        }
-    }
+    	//temporary hack - needs addressing
+    	sockets := make(map[int]bool)
+    	if podNUMAAffinity.Mask[0] == 01 {
+        	sockets[1] = true
+    	} else if podNUMAAffinity.Mask[0] == 10 {
+        	sockets[0] = true
+    	} else if podNUMAAffinity.Mask[0] == 11 {
+        	sockets[1] = true
+        	sockets[0] = true
+    	}
+    	allocated := available.UnsortedList()[:needed]
+    	availableNUMAAligned := available
+    	glog.Infof("allDevice: %v", allDevices)
+    	for availID := range available {
+        	for _, device := range allDevices[resource] {
+            		glog.Infof("AvailID: %v DeviceID: %v", availID, device)
+            		if availID == device.ID {
+                		if !sockets[int(device.Socket)] {
+                    			delete(availableNUMAAligned, availID)
+                		}
+                	break
+            		}	    
+        	}
+    	}
     
 	if int(availableNUMAAligned.Len()) < needed {
-		return nil, fmt.Errorf("requested number of devices unavailable for %s. Requested: %d, Available: %d", resource, needed, available.Len())
-	}
-    
-    glog.Infof("Available after NUMA Alignment: %v", availableNUMAAligned)
-	allocated := availableNUMAAligned.UnsortedList()[:needed]
+        	glog.Infof("requested number of devices unavailable in an NUMA Aligned Manner for %s. Choosing arbitrary free devices.", resource)
+	} else {
+         	glog.Infof("Chosing NUMA Aligned Devices for %s.", resource)
+         	allocated = availableNUMAAligned.UnsortedList()[:needed]
+    	}
 	// Updates m.allocatedDevices with allocated devices to prevent them
 	// from being allocated to other pods/containers, given that we are
 	// not holding lock during the rpc call.
