@@ -145,6 +145,7 @@ func (m *ManagerImpl) GetTopologyHints(pod v1.Pod, container v1.Container) topol
     	glog.Infof("Devices in GetTopologyHints: %v", devices)
         var deviceMask []socketmask.SocketMask
         count := false
+        affinity := true
         for resourceObj, amountObj := range container.Resources.Requests {
             resource := string(resourceObj)
             amount := int64(amountObj.Value())
@@ -225,17 +226,22 @@ func (m *ManagerImpl) GetTopologyHints(pod v1.Pod, container v1.Container) topol
                 }
                 glog.Infof("deviceMask: %v", deviceMask)
                 count = true
-            }            
+
+				if len(device_socket_avail) > 1 {
+					glog.Infof("Device Socket Avail > 1")
+					affinity = false
+					for _, outerMask := range deviceMask {
+						for _, innerMask := range outerMask {
+							if innerMask == 0 {
+								affinity = true
+								break
+							}
+						}
+					}
+				} 
+            }
         }
-	affinity := false
-	for _, outerMask := range deviceMask {
-		for _, innerMask := range outerMask {
-			if innerMask == 0 {
-				affinity = true
-				break
-			}
-		}
-	}
+		glog.Infof("Devie Affinity: %v", affinity)
         return topologymanager.TopologyHints{
             SocketAffinity:	deviceMask,
             Affinity:	affinity,
